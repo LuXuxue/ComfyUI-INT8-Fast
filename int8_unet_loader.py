@@ -3,6 +3,10 @@ import torch
 import folder_paths
 import comfy.sd
 import comfy.utils
+import comfy.model_detection
+import comfy.lora
+import comfy.lora_convert
+import logging
 
 from .int8_quant import Int8TensorwiseOps
 
@@ -12,7 +16,6 @@ class UNetLoaderINTW8A8:
     Load INT8 tensorwise quantized diffusion models.
     
     Uses Int8TensorwiseOps for direct int8 loading.
-    Inference uses fast torch._int_mm for blazing speed. (insert rocket emoji, fire emoji to taste)
     """
     
     @classmethod
@@ -21,28 +24,34 @@ class UNetLoaderINTW8A8:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"],),
-                "model_type": (["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "ernie", "anima"],),
-                "on_the_fly_quantization": ("BOOLEAN", {"default": False}),
-                "enable_quarot": ("BOOLEAN", {"default": False, "tooltip": "Enable QuaRot (Hadamard rotation) for better quantization."}),
-                "dynamic_lora": ("BOOLEAN", {"default": False, "tooltip": "Dynamic LoRA: apply LoRA at inference time (requires INT8LoraLoader). When OFF, LoRA is baked into INT8 weights at load time — the native ComfyUI LoRA Loader works directly."}),
-                #"enable_triton": ("BOOLEAN", {"default": True, "tooltip": "Use the Triton fused INT8 kernel. Disable to fall back to torch._int_mm (useful for debugging or unsupported GPUs)."}),
+                "model_type": (["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "ernie", "anima"], {"tooltip": "Only used for on the fly quantization, to filter sensitive layers."}),
+                "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize a higher precision model to INT8. If the selected model is already INT8 keep unchecked."}),
+                "enable_quarot": ("BOOLEAN", {"default": True, "tooltip": "Enable QuaRot for better quantization. ~1.1x slower, but near-GGUF_Q8 quality."}),
+                "dynamic_lora": ("BOOLEAN", {"default": False, "tooltip": "Apply LoRA dynamically at inference time. Slow. Only works with LoRA. Keep disabled unless you really need this."}),
+            },
+            "optional": {
+                "pre_lora": ("PRE_LORA",),
             }
         }
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
     CATEGORY = "loaders"
-    DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
+    DESCRIPTION = "Load and Quantize INT8 models with fast triton inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_quarot=False, dynamic_lora=False):
+    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_quarot=False, dynamic_lora=False, pre_lora=None):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
+        
+        if pre_lora is not None:
+            loras_to_load = pre_lora if isinstance(pre_lora, list) else [pre_lora]
+        else:
+            loras_to_load = []
         
         # Use Int8TensorwiseOps for proper direct int8 loading
         model_options = {"custom_operations": Int8TensorwiseOps}
         
         # We need to peek at the model type to set exclusions for Flux
         # ComfyUI loads metadata before the full model
-        from comfy.sd import load_diffusion_model
         
         # Set quantization flags
         Int8TensorwiseOps.excluded_names = []
@@ -95,14 +104,158 @@ class UNetLoaderINTW8A8:
                 'audio_scale_shift_table', 'av_ca_a2v_gate_adaln_single', 'av_ca_audio_scale_shift_adaln_single', 'av_ca_v2a_gate_adaln_single',
                 'av_ca_video_scale_shift_adaln_single', 'caption_projection', 'patchify_proj', 'proj_out', 'scale_shift_table',
             ]
-            #print(f"Applying model-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
 
-        # Load model directly - Int8TensorwiseOps handles int8 weights natively
-        model = load_diffusion_model(unet_path, model_options=model_options)
+        # Load state dict once to detect model and prepare LoRA
+        sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+        
+        # Pre-load LoRA if selected to bake it during quantization
+        Int8TensorwiseOps.lora_patches = {}
+        if len(loras_to_load) > 0:
+            grouped_patches = {}
+            for lora in loras_to_load:
+                lora_name = lora.get("lora_name", "None")
+                lora_strength = lora.get("lora_strength", 1.0)
+                
+                if lora_name == "None":
+                    continue
+                    
+                lora_path = folder_paths.get_full_path("loras", lora_name)
+                lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                lora_data = comfy.lora_convert.convert_lora(lora_data) # Handle various LoRA formats
+                
+                # Use a skeleton model to build the proper key_map.
+                # This is fast because Int8TensorwiseOps.Linear skips weight initialization.
+                unet_prefix = comfy.model_detection.unet_prefix_from_state_dict(sd)
+                m_config = comfy.model_detection.model_config_from_unet(sd, unet_prefix, metadata=metadata)
+                
+                # Fallback: some models like Flux might fail with the extracted prefix
+                if m_config is None and unet_prefix != "":
+                    m_config = comfy.model_detection.model_config_from_unet(sd, "", metadata=metadata)
+                    if m_config is not None:
+                        unet_prefix = ""
+
+                if m_config is not None:
+                    m_config.custom_operations = Int8TensorwiseOps
+                    skeleton_model = m_config.get_model(sd, unet_prefix)
+                    key_map = comfy.lora.model_lora_keys_unet(skeleton_model, {})
+
+                    
+                    patch_dict = comfy.lora.load_lora(lora_data, key_map)
+                    
+                    # Normalize keys and group patches by target layer to support offsets/functions
+                    # We want the keys to match what the model's Linear._load_from_state_dict will see.
+                    def normalize_key(key):
+                        if not isinstance(key, str):
+                            return key
+                        for p in ["diffusion_model.", "model.diffusion_model.", "model.", "transformer."]:
+                            if key.startswith(p):
+                                return key[len(p):]
+                        return key
+                    
+                    for k, v in patch_dict.items():
+                        target_key = k
+                        offset = None
+                        function = None
+                        if isinstance(k, tuple):
+                            target_key = k[0]
+                            if len(k) > 1: offset = k[1]
+                            if len(k) > 2: function = k[2]
+                        
+                        nk = normalize_key(target_key)
+                        if nk not in grouped_patches:
+                            grouped_patches[nk] = []
+                        grouped_patches[nk].append((v, offset, function, lora_strength))
+                else:
+                    logging.warning(f"INT8 Fast: Could not detect model type for LoRA mapping.")
+                
+                del lora_data
+            
+            if grouped_patches:
+                Int8TensorwiseOps.lora_patches = grouped_patches
+                logging.info(f"INT8 Fast: Prepared {len(grouped_patches)} layer patches for baking.")
+            
+        # Load model using the already-loaded state dict
+        try:
+            Int8TensorwiseOps.applied_lora_patches = set()
+            model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
+            
+            # Print unmatched keys to help with debugging
+            if Int8TensorwiseOps.lora_patches:
+                unmatched = set(Int8TensorwiseOps.lora_patches.keys()) - Int8TensorwiseOps.applied_lora_patches
+                if unmatched:
+                    print(f"INT8 Fast: {len(unmatched)} LoRA keys were NOT matched:")
+                    for k in sorted(unmatched):
+                        print(f"  unmatched: {k}")
+                else:
+                    print(f"INT8 Fast: All {len(Int8TensorwiseOps.lora_patches)} LoRA keys successfully baked!")
+        finally:
+            # Always clear patches after load to avoid sticking
+            Int8TensorwiseOps.lora_patches = {}
+            if hasattr(Int8TensorwiseOps, 'applied_lora_patches'):
+                delattr(Int8TensorwiseOps, 'applied_lora_patches')
         
         # Wrap in custom patcher for unified LoRA support
         from .int8_quant import INT8ModelPatcher
         model = INT8ModelPatcher.clone(model)
         
         return (model,)
+
+
+class PreLoraLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": { 
+                "lora_name_1": (["None"] + folder_paths.get_filename_list("loras"), ),
+                "lora_strength_1": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "id": "UNIQUE_ID"
+            }
+        }
+    
+    RETURN_TYPES = ("PRE_LORA",)
+    FUNCTION = "load_pre_lora"
+    CATEGORY = "loaders"
+    DESCRIPTION = "Pre-load a LoRA to bake it during quantization."
+
+    @classmethod
+    def VALIDATE_INPUTS(s, **kwargs):
+        return True
+
+    def load_pre_lora(self, **kwargs):
+        loras = []
+        
+        # ComfyUI strips dynamic inputs that aren't in INPUT_TYPES.
+        # We can recover them from the raw prompt dictionary.
+        prompt = kwargs.get("prompt", {})
+        node_id = kwargs.get("id", None)
+        
+        if prompt and node_id and node_id in prompt:
+            node_inputs = prompt[node_id].get("inputs", {})
+        else:
+            node_inputs = kwargs
+
+        if "lora_name" in node_inputs:
+            name = node_inputs["lora_name"]
+            strength = node_inputs.get("lora_strength", 1.0)
+            if name != "None" and strength != 0.0:
+                loras.append({"lora_name": name, "lora_strength": strength})
+                
+        i = 1
+        while True:
+            name_key = f"lora_name_{i}"
+            strength_key = f"lora_strength_{i}"
+            if name_key in node_inputs:
+                name = node_inputs[name_key]
+                strength = node_inputs.get(strength_key, 1.0)
+                if name != "None" and strength != 0.0:
+                    loras.append({"lora_name": name, "lora_strength": strength})
+                i += 1
+            else:
+                break
+                
+        return (loras,)
+
 

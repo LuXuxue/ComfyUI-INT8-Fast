@@ -39,6 +39,33 @@ def quantize_int8_axiswise(x: Tensor, dim: int) -> tuple[Tensor, Tensor]:
 def dequantize(q: Tensor, scale: float | Tensor) -> Tensor:
     return q.float() * scale
 
+def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0) -> Tensor:
+    """
+    Quantize a delta tensor to INT8 using stochastic rounding.
+    Used for LoRA deltas to minimize quantization error.
+    """
+    generator = torch.Generator(device=x.device)
+    generator.manual_seed(seed)
+    
+    # Scale to INT8 range — move scale to x's device to handle CPU-stored scales
+    if isinstance(scale, torch.Tensor):
+        scale = scale.to(x.device)
+    x_scaled = x / scale
+    
+    # Stochastic rounding
+    x_floor = torch.floor(x_scaled)
+    fraction = x_scaled - x_floor
+    del x_scaled # High-precision input no longer needed
+    
+    # Speed optimization: Create random values directly on the target device
+    random_vals = torch.rand(x_floor.shape, generator=generator, device=x.device, dtype=x_floor.dtype)
+    x_rounded = torch.where(random_vals < fraction, x_floor + 1, x_floor)
+    
+    del random_vals
+    del fraction
+    del x_floor
+    
+    return torch.clamp(x_rounded, -128, 127).to(torch.int8)
 
 
 
@@ -98,16 +125,6 @@ def int8_forward_dynamic_per_row(x: Tensor, weight: Tensor, weight_scale: Tensor
         res_scaled = res_scaled + bias.to(compute_dtype)
     return res_scaled
 
-
-
-
-# =============================================================================
-# INT8 LoRA Adapter - High Precision, Low RAM Patching
-# =============================================================================
-
-
-
-
 # =============================================================================
 # Int8TensorwiseOps - ComfyUI Custom Operations
 # =============================================================================
@@ -130,6 +147,8 @@ if _COMFY_OPS_AVAILABLE:
         use_triton = True  # Toggle for Triton fused kernel (mirrors _use_triton)
         _is_prequantized = False # Keep this as a status flag, but don't use for detection
         dynamic_lora = False # If True, apply LoRA dynamically at inference; if False, bake into INT8 weights at load time
+        lora_patches = {} # Map of model_key -> patch list (from load_lora)
+        lora_strength = 1.0
         
         class Linear(manual_cast.Linear):
             def __init__(self, *args, **kwargs):
@@ -147,6 +166,53 @@ if _COMFY_OPS_AVAILABLE:
             
             def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
                 weight_key = prefix + "weight"
+                
+                # Utility to normalize keys by stripping common prefixes
+                def normalize_key(key):
+                    if not isinstance(key, str):
+                        return key
+                    for p in ["diffusion_model.", "model.diffusion_model.", "model.", "transformer."]:
+                        if key.startswith(p):
+                            return key[len(p):]
+                    return key
+
+                def apply_lora_patches(tensor, key):
+                    if not Int8TensorwiseOps.lora_patches or tensor.dtype == torch.int8:
+                        return tensor
+                    nk = normalize_key(key)
+                    patches = Int8TensorwiseOps.lora_patches.get(nk)
+                    if patches:
+                        # calculate_weight expects: [(strength, v, strength_model, offset, function)]
+                        formatted = []
+                        for patch in patches:
+                            if len(patch) == 4:
+                                v, offset, function, strength = patch
+                            else:
+                                v, offset, function = patch
+                                strength = getattr(Int8TensorwiseOps, "lora_strength", 1.0)
+                            formatted.append((strength, v, 1.0, offset, function))
+                        
+                        # Track applied patches
+                        if not hasattr(Int8TensorwiseOps, 'applied_lora_patches'):
+                            Int8TensorwiseOps.applied_lora_patches = set()
+                        Int8TensorwiseOps.applied_lora_patches.add(nk)
+
+                        # Print only if multiple sub-patches map to the same layer
+                        if "weight" in key and len(patches) > 1:
+                            print(f"INT8 Fast: Baking multiple LoRA parts into {nk} ({len(patches)} sub-patches)")
+                            
+                        # ComfyUI dynamically patches during inference using lora_compute_dtype()
+                        # On most modern GPUs, this evaluates to torch.float16. 
+                        # We simulate that exact intermediate cast here to achieve a 1:1 binary match.
+                        import comfy.model_management
+                        device = torch.device("cuda") if torch.cuda.is_available() else tensor.device
+                        temp_dtype = comfy.model_management.lora_compute_dtype(device)
+                        
+                        tensor_temp = tensor.to(temp_dtype)
+                        result_temp = comfy.lora.calculate_weight(formatted, tensor_temp, key)
+                        return result_temp.to(tensor.dtype)
+                    return tensor
+
                 scale_key = prefix + "weight_scale"
                 input_scale_key = prefix + "input_scale"
                 bias_key = prefix + "bias"
@@ -168,6 +234,7 @@ if _COMFY_OPS_AVAILABLE:
                 comfy_quant_tensor = pop_metadata(state_dict, prefix, "comfy_quant")
 
                 weight_tensor = state_dict.pop(weight_key, None)
+                bias_tensor = state_dict.pop(bias_key, None)
 
                 # Pop input_scale to clean state_dict, but ignore it
                 _ = state_dict.pop(input_scale_key, None)
@@ -178,12 +245,18 @@ if _COMFY_OPS_AVAILABLE:
                         quant_conf = json.loads(bytes(comfy_quant_tensor.tolist()).decode('utf-8'))
                         if quant_conf.get("quarot", False):
                             self._use_quarot = True
-                            Int8TensorwiseOps.enable_quarot = True  # Propagate globally for LoRAs
+                            Int8TensorwiseOps.enable_quarot = True  # Propagate globally for LoRA
                             if "quarot_groupsize" in quant_conf:
                                 self._quarot_groupsize = quant_conf["quarot_groupsize"]
                                 Int8TensorwiseOps._global_quarot_groupsize = self._quarot_groupsize
                     except Exception:
                         pass
+                
+                # Apply LoRA patches to weight and bias once
+                if weight_tensor is not None:
+                    weight_tensor = apply_lora_patches(weight_tensor, weight_key)
+                if bias_tensor is not None:
+                    bias_tensor = apply_lora_patches(bias_tensor, bias_key)
                 
                 if weight_tensor is not None:
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
@@ -211,7 +284,7 @@ if _COMFY_OPS_AVAILABLE:
                             self.weight_scale = None
                             self._is_per_row = False
                             
-                    elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                    elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float8_e4m3fn):
                         # Load High-Precision
                         is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
                         is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
@@ -228,7 +301,7 @@ if _COMFY_OPS_AVAILABLE:
                                 print(f"INT8 Fast: Quantizing on-the-fly (QuaRot: {getattr(Int8TensorwiseOps, 'enable_quarot', False)})")
                                 Int8TensorwiseOps._logged_otf = True
 
-                            # Cast to float32 before rotation and scale computation, may be snake oil but can it hurt?
+                            # Cast to float32 before rotation and scale computation
                             w_gpu = weight_tensor.to(device, non_blocking=True).float()
                             
                             self._use_quarot = False
@@ -256,7 +329,7 @@ if _COMFY_OPS_AVAILABLE:
                 else:
                     missing_keys.append(weight_key)
                 
-                bias_tensor = state_dict.pop(bias_key, None)
+                # Assign bias if it exists (already patched if needed)
                 if bias_tensor is not None:
                     self.bias = nn.Parameter(bias_tensor, requires_grad=False)
                 else:
@@ -499,7 +572,7 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
                     patched_weight_float = rotate_weight(patched_weight_float, H, group_size=group_size)
 
                 # 5. Re-quantize back to INT8 using the original scale
-                patched_weight_int8 = quantize_int8(patched_weight_float, scale)
+                patched_weight_int8 = stochastic_round_int8_delta(patched_weight_float, scale) #quantize_int8(patched_weight_float, scale) #stochastic_round_int8_delta(patched_weight_float, scale) #quantize_int8(patched_weight_float, scale)
 
                 # 6. Move back to original device and store
                 patched_weight_int8 = patched_weight_int8.to(weight_int8.device)

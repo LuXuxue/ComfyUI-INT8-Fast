@@ -82,7 +82,7 @@ except ImportError:
 # 3. Node Mappings
 # Wrap imports in try/except to prevent total failure if dependencies are missing
 try:
-    from .int8_unet_loader import UNetLoaderINTW8A8
+    from .int8_unet_loader import UNetLoaderINTW8A8, PreLoraLoader
     from .int8_lora import INT8GroupedLora
     from .int8_save import INT8ModelSave
     
@@ -90,20 +90,25 @@ try:
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
         "INT8GroupedLora": INT8GroupedLora,
         "INT8ModelSave": INT8ModelSave,
+        "INT8PreLoraLoader": PreLoraLoader,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
         "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
         "INT8GroupedLora": "INT8 Grouped LoRA",
         "INT8ModelSave": "Save Int8 Model",
+        "INT8PreLoraLoader": "INT8 Pre-Lora Loader",
     }
 except ImportError as e:
     logging.error(f"Int88: Failed to import nodes: {e}")
     NODE_CLASS_MAPPINGS = {}
     NODE_DISPLAY_NAME_MAPPINGS = {}
 
+WEB_DIRECTORY = "./js"
+
 __all__ = [
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
+    "WEB_DIRECTORY",
     "Int8TensorwiseOps",
 ]
