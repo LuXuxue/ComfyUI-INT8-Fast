@@ -8,7 +8,7 @@ The TLDR is that Pre-Lora is within marging of error of Dynamic Lora. Post-Lora 
 
 Anima:
 
-32 Samples
+32 Samples per column.
 
 | Metric | INT8 ConvRot Pre-Lora | INT8 ConvRot Dynamic Lora | INT8 ConvRot Post-Lora | GGUF Q8_0 Lora | FP8 Lora |
 | :--- | ---: | ---: | ---: | ---: | ---: |
