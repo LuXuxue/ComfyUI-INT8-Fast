@@ -41,6 +41,7 @@ However, ConvRot is also a little slower, so these prequantized models are still
 | Anima | [Download](https://huggingface.co/bertbobson/Anima-INT8-QUIP) |
 
 ¹Z-Image Base weights have been Deprecated in favor of Convrot OTF, which is higher quality.
+
 ²Tensorwise models are worse than on the fly quantization since we switched to row-wise INT8
 
 
@@ -68,6 +69,7 @@ Measured on a 3090 at 1024x1024, 26 steps with Flux2 Klein Base 9B.
 | INT8 R128 Lora | No slowdown, except if dynamic. |
 
 I would also like to point out that we beat Nunchaku INT4 on every quality measurement in the [Quality Metrics](Metrics.md)
+
 Additionally, the quality of loras applied with [this nunchaku lora node](https://github.com/ussoewwin/ComfyUI-QwenImageLoraLoader) appears to be degraded.
 
 Klein 9B, Measured on an 8gb 5060, same settings as the 3090 run:
