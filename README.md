@@ -61,10 +61,13 @@ Measured on a 3090 at 1024x1024, 26 steps with Flux2 Klein Base 9B.
 | Format | Speed (s/it) ↓ |
 |-------|--------------|
 | Nunchaku INT4 Best Quality | 1.21 |
+| Nunchaku INT4 with R128 Lora | 1.36 |
 | INT8 ConvRot compile | 1.26 |
 | INT8 Row compile ★| 1.18 |
+| INT8 R128 Lora | No slowdown, except if dynamic. |
 
 I would also like to point out that we beat Nunchaku INT4 on every quality measurement in the [Quality Metrics](Metrics.md)
+Additionally, the quality of loras applied with [this nunchaku lora node](https://github.com/ussoewwin/ComfyUI-QwenImageLoraLoader) appears to be degraded.
 
 Klein 9B, Measured on an 8gb 5060, same settings as the 3090 run:
 
