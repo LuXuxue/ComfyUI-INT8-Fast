@@ -3,6 +3,8 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import logging
 import comfy.model_patcher
+import comfy.memory_management
+import comfy.model_management
 import comfy.lora
 import comfy.utils
 
@@ -152,10 +154,37 @@ if _COMFY_OPS_AVAILABLE:
         lora_patches = {} # Map of model_key -> patch list (from load_lora)
         lora_strength = 1.0
         dynamic_load_device = None # Set by the loader when Aimdo should avoid a full CPU staging copy
+        skeleton_meta_init = False # Temporary mode for LoRA key-map discovery
         
         class Linear(manual_cast.Linear):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
+            def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+                if getattr(Int8TensorwiseOps, "skeleton_meta_init", False):
+                    nn.Module.__init__(self)
+                    self.in_features = in_features
+                    self.out_features = out_features
+                    tensor_kwargs = {"device": "meta"}
+                    if dtype is not None:
+                        tensor_kwargs["dtype"] = dtype
+                    self.weight = nn.Parameter(torch.empty((out_features, in_features), **tensor_kwargs), requires_grad=False)
+                    self.bias = nn.Parameter(torch.empty((out_features,), **tensor_kwargs), requires_grad=False) if bias else None
+                    self.weight_comfy_model_dtype = dtype
+                    self.bias_comfy_model_dtype = dtype
+                # Preserve ComfyUI's Windows/Aimdo lazy-init path. The base
+                # disable_weight_init.Linear only takes this path for classes
+                # that do not override _load_from_state_dict; this INT8 class
+                # does override it, so calling super() would allocate full
+                # skeleton weights during Pre-LoRA key-map discovery.
+                elif comfy.model_management.WINDOWS and comfy.memory_management.aimdo_enabled:
+                    nn.Module.__init__(self)
+                    self.in_features = in_features
+                    self.out_features = out_features
+                    self.weight = None
+                    self.bias = None
+                    self.comfy_need_lazy_init_bias = bias
+                    self.weight_comfy_model_dtype = dtype
+                    self.bias_comfy_model_dtype = dtype
+                else:
+                    super().__init__(in_features, out_features, bias, device, dtype)
                 self.register_buffer('weight_scale', None)
                 self._is_quantized = False
                 self._is_per_row = False  # Track quantization granularity

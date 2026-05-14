@@ -154,7 +154,11 @@ class UNetLoaderINTW8A8:
 
                 if m_config is not None:
                     m_config.custom_operations = Int8TensorwiseOps
-                    skeleton_model = m_config.get_model(sd, unet_prefix)
+                    Int8TensorwiseOps.skeleton_meta_init = True
+                    try:
+                        skeleton_model = m_config.get_model(sd, unet_prefix)
+                    finally:
+                        Int8TensorwiseOps.skeleton_meta_init = False
                     key_map = comfy.lora.model_lora_keys_unet(skeleton_model, {})
 
                     
