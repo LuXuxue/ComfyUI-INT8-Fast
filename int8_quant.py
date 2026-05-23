@@ -8,6 +8,13 @@ import comfy.model_management
 import comfy.lora
 import comfy.utils
 
+try:
+    import comfy_aimdo.host_buffer
+    import comfy_aimdo.torch
+    _AIMDO_FILE_SLICE_LOAD = True
+except Exception:
+    _AIMDO_FILE_SLICE_LOAD = False
+
 # Add this at the top of your file
 try:
     from .int8_fused_kernel import triton_int8_linear
@@ -41,6 +48,29 @@ def quantize_int8_axiswise(x: Tensor, dim: int) -> tuple[Tensor, Tensor]:
 
 def dequantize(q: Tensor, scale: float | Tensor) -> Tensor:
     return q.float() * scale
+
+def tensor_to_device_file_slice(tensor: Tensor, device: torch.device) -> Tensor:
+    if (
+        not _AIMDO_FILE_SLICE_LOAD
+        or tensor.device.type != "cpu"
+        or device is None
+        or device.type != "cuda"
+    ):
+        return tensor.to(device, non_blocking=True)
+
+    size = tensor.numel() * tensor.element_size()
+    if size == 0:
+        return tensor.to(device, non_blocking=True)
+
+    hostbuf = comfy_aimdo.host_buffer.HostBuffer(size)
+    host_tensor = comfy_aimdo.torch.hostbuf_to_tensor(hostbuf)
+    host_view = host_tensor[:size].view(dtype=tensor.dtype).view(tensor.shape)
+    if comfy.memory_management.read_tensor_file_slice_into(tensor, host_view):
+        out = torch.empty_like(tensor, device=device)
+        out.copy_(host_view, non_blocking=False)
+        return out
+
+    return tensor.to(device, non_blocking=True)
 
 def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0) -> Tensor:
     """
@@ -222,7 +252,7 @@ if _COMFY_OPS_AVAILABLE:
                     return tensor
 
                 temp_dtype = comfy.model_management.lora_compute_dtype(device)
-                tensor_temp = tensor.to(device=device, dtype=temp_dtype, non_blocking=True)
+                tensor_temp = tensor_to_device_file_slice(tensor, device).to(dtype=temp_dtype)
                 return comfy.lora.calculate_weight(self._format_lora_patches(patches), tensor_temp, key)
 
             def finalize_pending_int8(self):
@@ -243,7 +273,7 @@ if _COMFY_OPS_AVAILABLE:
                         print(f"INT8 Fast: Quantizing on-the-fly (ConvRot: {pending.get('enable_convrot', False)})")
                         Int8TensorwiseOps._logged_otf = True
 
-                    w_gpu = weight_tensor.to(device, non_blocking=True).float()
+                    w_gpu = tensor_to_device_file_slice(weight_tensor, device).float()
 
                     self._use_convrot = False
                     if pending.get("enable_convrot", False) and self.in_features % CONVROT_GROUP_SIZE == 0:
