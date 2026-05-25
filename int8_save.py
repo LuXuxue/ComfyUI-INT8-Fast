@@ -1,10 +1,44 @@
 import folder_paths
 import comfy.sd
 import comfy.model_patcher
+import comfy.model_management
 import json
 import os
+import logging
 import torch
 from comfy.cli_args import args
+
+
+def _resolve_source_metadata(model):
+    """Walk the patcher clone chain and the inner model object to recover the
+    original safetensors metadata that was stashed by UNetLoaderINTW8A8.
+
+    ComfyUI's ``ModelPatcher.clone()`` builds a fresh patcher and does not copy
+    over arbitrary attributes set on the source patcher. INT8GroupedLora and
+    other downstream nodes call ``model.clone()``, which would otherwise drop
+    the ``_safetensors_metadata`` stash and produce a checkpoint missing the
+    ``int8_quantized`` / ``int8_model_type`` / ``config`` (LTX2) flags that the
+    loader relies on for round-trips.
+    """
+    seen = set()
+
+    def _walk(m):
+        if m is None or id(m) in seen:
+            return None
+        seen.add(id(m))
+        meta = getattr(m, "_safetensors_metadata", None)
+        if isinstance(meta, dict) and meta:
+            return meta
+        inner = getattr(m, "model", None)
+        if inner is not None:
+            inner_meta = getattr(inner, "_int8_source_metadata", None)
+            if isinstance(inner_meta, dict) and inner_meta:
+                return inner_meta
+        parent = getattr(m, "parent", None)
+        return _walk(parent)
+
+    return _walk(model)
+
 
 class INT8ModelSave:
     def __init__(self):
@@ -28,10 +62,18 @@ class INT8ModelSave:
             prompt_info = json.dumps(prompt)
 
         metadata = {}
-        # Preserve source safetensors metadata (int8_quantized, int8_model_type, ltx2 config, etc.)
-        src_meta = getattr(model, "_safetensors_metadata", None)
+        # Preserve source safetensors metadata (int8_quantized, int8_model_type,
+        # ltx2 config, etc.). Walk the patcher chain because INT8GroupedLora's
+        # clone strips this attribute from the local patcher.
+        src_meta = _resolve_source_metadata(model)
         if isinstance(src_meta, dict):
             metadata.update(src_meta)
+        if not src_meta:
+            logging.warning(
+                "INT8 Save: source safetensors metadata could not be located on the patcher chain. "
+                "The output checkpoint will be saved without int8_quantized/int8_model_type/config metadata, "
+                "which may break re-loading for some models (notably LTX2)."
+            )
         # if not args.disable_metadata:
         #     metadata["prompt"] = prompt_info
         #     if extra_pnginfo is not None:
@@ -42,7 +84,7 @@ class INT8ModelSave:
         output_checkpoint = os.path.join(full_output_folder, output_checkpoint)
 
         extra_keys = {}
-        
+
         patched_modules = []
         patched_module_ids = set()
 
@@ -67,7 +109,6 @@ class INT8ModelSave:
             if hasattr(model_patcher, "model") and hasattr(model_patcher.model, "named_modules"):
                 yield from model_patcher.model.named_modules()
 
-        
         # Finalize any deferred INT8 layers (Aimdo/Windows deferred-load path sets
         # _pending_int8_finalize instead of quantizing immediately). Without this,
         # those modules still have _is_quantized=False at save time and no
@@ -76,7 +117,44 @@ class INT8ModelSave:
         if finalize_fn is not None:
             finalize_fn()
 
-        # We need to peek at the model's actual modules to save comfy_quant and weight_scale
+        # CRITICAL: Apply any pending LoRA / model patches BEFORE collecting
+        # extra_keys and BEFORE save_checkpoint runs its own load_models_gpu().
+        #
+        # Why: when LoRAs were stacked via INT8GroupedLora (or the standard
+        # LoRA loader), the patches live on the model patcher and are only
+        # baked into the int8 weights when ``patch_model`` runs. ``save_checkpoint``
+        # internally calls ``load_models_gpu`` which does trigger the bake, but
+        # we also need to observe the post-bake module state to emit accurate
+        # ``comfy_quant`` / scalar ``weight_scale`` extra_keys (and to be sure
+        # ``module.comfy_patched_weights`` is set so ``model_state_dict_for_saving``
+        # emits the int8 weight directly instead of wrapping it in a
+        # LazyCastingParam, which assumes float dtypes).
+        #
+        # ``force_full_load=True`` keeps every patched layer on-device so we
+        # see consistent int8 weights for every module, even on lowvram setups.
+        try:
+            comfy.model_management.load_models_gpu([model], force_full_load=True)
+        except Exception as e:
+            logging.warning(
+                f"INT8 Save: full-load pre-pass failed ({e}); falling back to "
+                "default load_models_gpu without force_full_load."
+            )
+            try:
+                comfy.model_management.load_models_gpu([model])
+            except Exception as e2:
+                logging.warning(
+                    f"INT8 Save: load_models_gpu fallback also failed ({e2}); "
+                    "continuing best-effort. The saved checkpoint may be "
+                    "incomplete if LoRA patches were not applied."
+                )
+
+        # Re-finalize after load_models_gpu in case any aimdo deferred layers
+        # were materialized only during the load pass.
+        if finalize_fn is not None:
+            finalize_fn()
+
+        # Collect comfy_quant and (scalar) weight_scale extra_keys based on
+        # the post-patch module state.
         if hasattr(model, "model"):
             for name, module in iter_model_modules(model):
                 if module_has_int8_param(module):
@@ -84,26 +162,43 @@ class INT8ModelSave:
                     # with requires_grad=True by default, which is invalid for
                     # int8 tensors. Mark all int8 modules for direct save.
                     mark_module_for_direct_save(module)
-                
-                # Only log modules that are INT8-aware (have _is_quantized attribute)
-                # if hasattr(module, '_is_quantized'):
-                #     print(f"[INT8Save] int8 module: '{name}' | _is_quantized={module._is_quantized}")
 
                 if getattr(module, "_is_quantized", False):
-                    # 1. Comfy Quant Hint
-                    quant_conf = {"convrot": getattr(module, "_use_convrot", False)}
-                    if hasattr(module, "_convrot_groupsize"):
-                        quant_conf["convrot_groupsize"] = module._convrot_groupsize
-                        
-                    # Prepend 'model.' as comfy.sd.save_checkpoint typically adds this to all weights
-                    # but may not add it to extra_keys. This ensures they stay alongside weights.
+                    use_convrot = bool(getattr(module, "_use_convrot", False))
+                    quant_conf = {"convrot": use_convrot}
+                    # Always emit a groupsize when convrot is on, even if the
+                    # module is using the default. Older save paths only wrote
+                    # this field when ``_convrot_groupsize`` had been set
+                    # explicitly, which left on-the-fly-quantized layers with
+                    # an unspecified groupsize and forced the loader to fall
+                    # back to ``CONVROT_GROUP_SIZE`` (which happens to match
+                    # today, but is fragile if the default ever changes).
+                    if use_convrot:
+                        try:
+                            from .int8_quant import CONVROT_GROUP_SIZE
+                        except Exception:
+                            CONVROT_GROUP_SIZE = 256
+                        quant_conf["convrot_groupsize"] = int(
+                            getattr(module, "_convrot_groupsize", CONVROT_GROUP_SIZE)
+                        )
+
+                    # Track granularity so the loader can pick the matching
+                    # forward kernel without re-inspecting tensor shapes.
+                    quant_conf["per_row"] = bool(getattr(module, "_is_per_row", False))
+
+                    # Prepend 'model.' as comfy.sd.save_checkpoint adds this
+                    # prefix to all weights; extra_keys are NOT auto-prefixed
+                    # so we must do it ourselves to keep them aligned with the
+                    # owning weight tensor.
                     prefix = "model." + name + "." if name else "model."
-                    
+
                     extra_keys[prefix + "comfy_quant"] = torch.tensor(
                         list(json.dumps(quant_conf).encode('utf-8')), dtype=torch.uint8
                     )
-                    
-                    # 2. Handle scalar weight_scale which is not registered as a buffer
+
+                    # Handle scalar weight_scale which is not registered as a
+                    # persistent buffer (so it would be missing from
+                    # state_dict() entirely).
                     if getattr(module, "_weight_scale_scalar", None) is not None:
                         extra_keys[prefix + "weight_scale"] = torch.tensor(module._weight_scale_scalar)
 
@@ -132,6 +227,9 @@ class INT8ModelSave:
                 if had_flag:
                     module.comfy_patched_weights = old_flag
                 else:
-                    delattr(module, "comfy_patched_weights")
-                    
+                    try:
+                        delattr(module, "comfy_patched_weights")
+                    except AttributeError:
+                        pass
+
         return {}
