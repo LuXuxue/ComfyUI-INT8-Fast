@@ -8,6 +8,14 @@ import comfy.model_management
 import comfy.lora
 import comfy.utils
 
+compute_dtype = torch.float16
+GTX1650_COMPAT_MODE = False
+def set_gtx1650_compat_mode(enabled: bool):
+    global GTX1650_COMPAT_MODE
+    GTX1650_COMPAT_MODE = enabled
+    compute_dtype = torch.float32
+    logging.info(f"INT8-Fast: GTX1650 Compatibility Mode {'ENABLED' if enabled else 'DISABLED'}")
+
 try:
     import comfy_aimdo.host_buffer
     import comfy_aimdo.torch
@@ -110,6 +118,9 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
     
     # --- FAST PATH: Triton Fused Kernel ---
     if _TRITON_AVAILABLE and _use_triton and x.is_cuda:
+        if GTX1650_COMPAT_MODE:
+            x_triton = x.to(torch.float32) if x.dtype in (torch.bfloat16, torch.float16) else x
+            return triton_int8_linear(x_triton, weight, weight_scale, bias, compute_dtype)
         return triton_int8_linear(x, weight, weight_scale, bias, compute_dtype)
 
     # --- SLOW PATH: Standard PyTorch ---
@@ -141,6 +152,9 @@ def int8_forward_dynamic_per_row(x: Tensor, weight: Tensor, weight_scale: Tensor
     """
     # --- FAST PATH: Triton Fused Kernel (per-row) ---
     if _TRITON_AVAILABLE and _use_triton and x.is_cuda:
+        if GTX1650_COMPAT_MODE:
+            x_triton = x.to(torch.float32) if x.dtype in (torch.bfloat16, torch.float16) else x
+            return triton_int8_linear_per_row(x_triton, weight, weight_scale, bias, compute_dtype)
         return triton_int8_linear_per_row(x, weight, weight_scale, bias, compute_dtype)
 
     # --- SLOW PATH: Standard PyTorch ---
@@ -220,7 +234,10 @@ if _COMFY_OPS_AVAILABLE:
                 self._is_per_row = False  # Track quantization granularity
                 self._use_convrot = False  # Track if ConvRot was applied
                 self._weight_scale_scalar = None  # For scalar (non-tensor) scales
-                self.compute_dtype = torch.bfloat16
+                if GTX1650_COMPAT_MODE:
+                    self.compute_dtype = torch.float32
+                else:
+                    self.compute_dtype = torch.bfloat16
                 self.lora_patches = []  # List of (down_scaled, up, start, size) set by INT8ModelPatcher
             
             def reset_parameters(self):
@@ -588,6 +605,10 @@ if _COMFY_OPS_AVAILABLE:
             def forward(self, x: Tensor) -> Tensor:
                 """Fast forward using torch._int_mm for quantized weights."""
                 
+                orig_x_dtype = x.dtype
+                if GTX1650_COMPAT_MODE and x.dtype == torch.bfloat16:
+                    x = x.to(torch.float16)
+
                 # Check if ComfyUI needs to manage weight transfer (VBAR, offloading, LoRA patches, etc.)
                 # This mirrors the base class check in disable_weight_init.Linear.forward()
                 need_cast = self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0
@@ -618,15 +639,22 @@ if _COMFY_OPS_AVAILABLE:
                 if isinstance(w_scale, torch.Tensor) and w_scale.device != x.device:
                     w_scale = w_scale.to(x.device, non_blocking=True)
                 
-                compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+                if GTX1650_COMPAT_MODE:
+                    compute_dtype = torch.float32
+                else:
+                    compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
                 
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
                 
+                orig_dtype = x_2d.dtype
+                if GTX1650_COMPAT_MODE and x_2d.dtype in (torch.bfloat16, torch.float16):
+                    x_2d = x_2d.to(torch.float32)
+                
                 if getattr(self, "_use_convrot", False):
                     from .convrot import build_hadamard, rotate_activation
                     group_size = getattr(self, "_convrot_groupsize", CONVROT_GROUP_SIZE)
-                    H = build_hadamard(group_size, device=x.device, dtype=x.dtype)
+                    H = build_hadamard(group_size, device=x.device, dtype=x_2d.dtype)
                     x_2d = rotate_activation(x_2d, H, group_size=group_size)
                 
                 # Sync the loader toggle to the module-level flag read by the forward fns
@@ -641,8 +669,8 @@ if _COMFY_OPS_AVAILABLE:
                         y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
                 else:
                     # Small batch fallback
-                    w_float = dequantize(weight, w_scale).to(x.dtype)
-                    bias_typed = bias.to(x.dtype) if bias is not None else None
+                    w_float = dequantize(weight, w_scale).to(x_2d.dtype)
+                    bias_typed = bias.to(x_2d.dtype) if bias is not None else None
                     y = F.linear(x_2d, w_float, bias_typed)
                 
                 # Dynamic LoRA Path — handles split QKV via per-patch offsets
@@ -660,7 +688,11 @@ if _COMFY_OPS_AVAILABLE:
                 
                 if need_cast:
                     uncast_bias_weight(self, weight, bias, offload_stream)
-                return y.reshape(*x_shape[:-1], y.shape[-1])
+                if GTX1650_COMPAT_MODE:
+                    target_dtype = torch.float16 if orig_x_dtype == torch.bfloat16 else orig_x_dtype
+                    return y.reshape(*x_shape[:-1], y.shape[-1]).to(target_dtype)
+                else:
+                    return y.reshape(*x_shape[:-1], y.shape[-1])
         
         # Pass-through for other layers
         class GroupNorm(manual_cast.GroupNorm): pass
@@ -936,6 +968,18 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
         return super().patch_weight_to_device(key, device_to, inplace_update, return_weight, force_cast)
 
     def load(self, *args, **kwargs):
+        if GTX1650_COMPAT_MODE:
+            try:
+                for module in self.model.modules():
+                    for name, param in module.named_parameters(recurse=False):
+                        if param is not None and param.dtype == torch.bfloat16:
+                            param.data = param.data.to(torch.float16)
+                    for name, buf in module.named_buffers(recurse=False):
+                        if buf is not None and buf.dtype == torch.bfloat16:
+                            buf.data = buf.data.to(torch.float16)
+            except Exception as e:
+                logging.warning(f"INT8 Fast: Failed to force cast bf16 to fp16: {e}")
+
         self.finalize_pending_int8()
 
         save_materialized = bool(getattr(self, "_int8_save_materialized_lora", False))
