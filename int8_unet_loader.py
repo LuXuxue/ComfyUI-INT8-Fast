@@ -11,7 +11,7 @@ import comfy.model_management
 import logging
 
 from .int8_quant import Int8TensorwiseOps
-
+from .int8_quant import set_gtx1650_compat_mode
 
 class UNetLoaderINTW8A8:
     """
@@ -31,6 +31,7 @@ class UNetLoaderINTW8A8:
                 "enable_convrot": ("BOOLEAN", {"default": True, "tooltip": "Enable ConvRot for better quantization. ~1.1x slower, but near-GGUF_Q8 quality."}),
                 "lora_mode": (["None", "Stochastic", "Dynamic"], {"default": "None", "tooltip": "None bakes LoRA patches with normal rounding which is the default behavior. Stochastic bakes with stochastic INT8 rounding, which can occasionally be closer to the BF16+lora baseline. Dynamic applies LoRA at inference time, which is slow and only works for conventional lora."}),
             },
+                "gtx1650_compat_mode": ("BOOLEAN", {"default": False, "tooltip": "Use fp32 compute dtype"}),
             "optional": {
                 "pre_lora": ("PRE_LORA",),
             }
@@ -41,7 +42,8 @@ class UNetLoaderINTW8A8:
     CATEGORY = "loaders"
     DESCRIPTION = "Load and Quantize INT8 models with fast triton inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot=False, lora_mode="None", pre_lora=None):
+    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot=False, lora_mode="None", pre_lora=None, gtx1650_compat_mode=False):
+        set_gtx1650_compat_mode(gtx1650_compat_mode)
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
 
         # Backward compatibility for workflows saved with the old dynamic_lora boolean widget.
