@@ -30,8 +30,8 @@ class UNetLoaderINTW8A8:
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize a higher precision model to INT8. If the selected model is already INT8 keep unchecked."}),
                 "enable_convrot": ("BOOLEAN", {"default": True, "tooltip": "Enable ConvRot for better quantization. ~1.1x slower, but near-GGUF_Q8 quality."}),
                 "lora_mode": (["None", "Stochastic", "Dynamic"], {"default": "None", "tooltip": "None bakes LoRA patches with normal rounding which is the default behavior. Stochastic bakes with stochastic INT8 rounding, which can occasionally be closer to the BF16+lora baseline. Dynamic applies LoRA at inference time, which is slow and only works for conventional lora."}),
-            },
                 "gtx1650_compat_mode": ("BOOLEAN", {"default": False, "tooltip": "Use fp32 compute dtype"}),
+            },
             "optional": {
                 "pre_lora": ("PRE_LORA",),
             }
