@@ -3,6 +3,14 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+compute_dtype = torch.float16
+GTX1650_COMPAT_MODE = False
+def set_gtx1650_compat_mode(enabled: bool):
+    global GTX1650_COMPAT_MODE
+    GTX1650_COMPAT_MODE = enabled
+    compute_dtype = torch.float32
+    logging.info(f"INT8-Fast: GTX1650 Compatibility Mode {'ENABLED' if enabled else 'DISABLED'}")
+
 # =============================================================================
 # Kernel 1: Fused Row-wise Quantization (FP16/BF16 -> INT8 + Scale)
 # =============================================================================
@@ -176,7 +184,7 @@ def _int8_matmul_dequant_kernel(
 # Python Wrapper
 # =============================================================================
 
-def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias=None, compute_dtype=torch.float16):
+def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias=None, compute_dtype=compute_dtype):
     """
     Fused pipeline for W8A8 Linear Layer.
     """
@@ -327,7 +335,7 @@ def _int8_matmul_dequant_per_row_kernel(
 # Python Wrapper (Per-Row Weight Scales)
 # =============================================================================
 
-def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias=None, compute_dtype=torch.float16):
+def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias=None, compute_dtype=compute_dtype):
     """
     Fused pipeline for W8A8 Linear Layer with per-row weight quantization.
     weight_scale: [N, 1] per-row scales
